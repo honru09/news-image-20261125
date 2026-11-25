@@ -1,15 +1,13 @@
-#!/usr/bin/env python3
-"""Copy entrypoint for the news-image-20261125 make.fun entry.
+"""news-image-20261125 -- copy the bundled picture to the output folder.
 
-Stdlib only. Copies the bundled ``entry.png`` (which must be a
-1024x1024 PNG of at most 1 MiB) into the output directory as
-``entry.png``. The output directory defaults to ``/output`` and can be
-overridden with the ``MAKEFUN_OUTPUT_DIR`` environment variable.
+The entry image lives in this repository next to this script. This
+program does one job: check that image thoroughly, then place an exact
+copy at <output>/entry.png. It never draws, downloads, or changes the
+pixels -- the copy is byte-for-byte the file that was reviewed.
 
-Before writing, the output directory's existing contents are removed
-(the directory itself is never deleted). The source image is validated
-first: PNG magic bytes and IHDR dimensions of exactly 1024x1024. Any
-failed check exits non-zero without writing an output file.
+Run it with no arguments. The destination defaults to /output and can
+be pointed elsewhere with MAKEFUN_OUTPUT_DIR, which the harness uses
+when it runs the program twice to confirm both runs agree.
 """
 
 import os
@@ -19,70 +17,84 @@ import sys
 import zlib
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+WANTED_WIDTH = 1024
+WANTED_HEIGHT = 1024
 MAX_BYTES = 1024 * 1024
-EXPECTED_WIDTH = 1024
-EXPECTED_HEIGHT = 1024
+CHUNK_HEADER = 8  # 4 bytes length + 4 bytes type
+CHUNK_FOOTER = 4  # 4 bytes CRC
 
 
 def fail(message):
-    print(f"error: {message}", file=sys.stderr)
-    sys.exit(1)
+    """Report a problem on stderr and stop with a failure exit code."""
+    print("error: " + message, file=sys.stderr)
+    return 1
 
 
-def validate_png(data):
-    """Validate the bundled image; exit 1 on the first problem found."""
-    if len(data) > MAX_BYTES:
-        fail(f"source image is {len(data)} bytes, over the 1 MiB limit")
-    if len(data) < 8 or data[:8] != PNG_MAGIC:
-        fail("source image does not start with the PNG magic bytes")
-    if len(data) < 33:
-        fail("source image is too short to contain an IHDR chunk")
+def read_source(path):
+    """Load the bundled picture, failing loudly if anything is off."""
+    try:
+        with open(path, "rb") as handle:
+            blob = handle.read()
+    except OSError as exc:
+        return None, "cannot read bundled image %s: %s" % (path, exc)
+    if len(blob) > MAX_BYTES:
+        return None, "bundled image is %d bytes, over the 1 MiB limit" % len(blob)
+    if len(blob) < len(PNG_MAGIC) or blob[: len(PNG_MAGIC)] != PNG_MAGIC:
+        return None, "bundled image does not start with the PNG signature"
+    return blob, None
 
-    offset = 8
-    seen_ihdr = False
-    seen_iend = False
-    while offset < len(data):
-        if offset + 8 > len(data):
-            fail("truncated PNG chunk header")
-        length = struct.unpack(">I", data[offset:offset + 4])[0]
-        chunk_type = data[offset + 4:offset + 8]
-        body_start = offset + 8
+
+def check_chunks(blob):
+    """Walk every PNG chunk, checking its CRC, up to and including IEND."""
+    offset = len(PNG_MAGIC)
+    seen_image_header = False
+    seen_end = False
+    while offset < len(blob):
+        if offset + CHUNK_HEADER + CHUNK_FOOTER > len(blob):
+            return "truncated chunk header at byte %d" % offset
+        (length,) = struct.unpack(">I", blob[offset : offset + 4])
+        kind = blob[offset + 4 : offset + 8]
+        body_start = offset + CHUNK_HEADER
         body_end = body_start + length
-        if body_end + 4 > len(data):
-            fail(f"truncated PNG chunk {chunk_type!r}")
-        chunk_data = data[body_start:body_end]
-        stored_crc = struct.unpack(">I", data[body_end:body_end + 4])[0]
-        actual_crc = zlib.crc32(chunk_type)
-        actual_crc = zlib.crc32(chunk_data, actual_crc)
-        if actual_crc != stored_crc:
-            fail(f"PNG chunk {chunk_type.decode('latin-1')} has a bad CRC")
-        if chunk_type == b"IHDR":
-            if seen_ihdr:
-                fail("duplicate IHDR chunk")
-            seen_ihdr = True
+        crc_end = body_end + CHUNK_FOOTER
+        if crc_end > len(blob):
+            return "chunk %r runs past the end of the file" % kind.decode(
+                "latin-1", "replace"
+            )
+        (stored_crc,) = struct.unpack(">I", blob[body_end:crc_end])
+        actual_crc = zlib.crc32(kind)
+        actual_crc = zlib.crc32(blob[body_start:body_end], actual_crc)
+        if (actual_crc & 0xFFFFFFFF) != stored_crc:
+            return "chunk %r fails its CRC32 check" % kind.decode(
+                "latin-1", "replace"
+            )
+        if kind == b"IHDR":
             if length != 13:
-                fail("IHDR chunk has the wrong length")
-            width, height = struct.unpack(">II", chunk_data[:8])
-            if width != EXPECTED_WIDTH or height != EXPECTED_HEIGHT:
-                fail(
-                    f"image is {width}x{height}, "
-                    f"expected {EXPECTED_WIDTH}x{EXPECTED_HEIGHT}"
+                return "IHDR chunk has the wrong length"
+            width, height = struct.unpack(">II", blob[body_start : body_start + 8])
+            if width != WANTED_WIDTH or height != WANTED_HEIGHT:
+                return "image is %dx%d, expected %dx%d" % (
+                    width,
+                    height,
+                    WANTED_WIDTH,
+                    WANTED_HEIGHT,
                 )
-        if chunk_type == b"IEND":
-            seen_iend = True
-            if body_end + 4 != len(data):
-                fail("trailing data after IEND chunk")
+            seen_image_header = True
+        if kind == b"IEND":
+            seen_end = True
+            if crc_end != len(blob):
+                return "trailing bytes after the IEND chunk"
             break
-        offset = body_end + 4
-    if not seen_ihdr:
-        fail("PNG has no IHDR chunk")
-    if not seen_iend:
-        fail("PNG has no IEND chunk")
+        offset = crc_end
+    if not seen_image_header:
+        return "no IHDR chunk found in the PNG"
+    if not seen_end:
+        return "no IEND chunk found in the PNG"
+    return None
 
 
-def clear_output_dir(path):
-    """Remove everything inside path, leaving path itself in place."""
-    os.makedirs(path, exist_ok=True)
+def empty_folder(path):
+    """Remove everything inside a folder, leaving the folder itself."""
     for name in os.listdir(path):
         target = os.path.join(path, name)
         if os.path.isdir(target) and not os.path.islink(target):
@@ -91,28 +103,42 @@ def clear_output_dir(path):
             os.unlink(target)
 
 
-def main():
+def run():
     here = os.path.dirname(os.path.abspath(__file__))
     source = os.path.join(here, "entry.png")
-    try:
-        with open(source, "rb") as handle:
-            data = handle.read()
-    except OSError as exc:
-        fail(f"cannot read bundled entry.png: {exc}")
+    blob, problem = read_source(source)
+    if problem is not None:
+        return fail(problem)
+    problem = check_chunks(blob)
+    if problem is not None:
+        return fail(problem)
 
-    validate_png(data)
-
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    clear_output_dir(output_dir)
-    destination = os.path.join(output_dir, "entry.png")
+    destination_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
     try:
-        with open(destination, "wb") as handle:
-            handle.write(data)
+        os.makedirs(destination_dir, exist_ok=True)
+        empty_folder(destination_dir)
+        destination = os.path.join(destination_dir, "entry.png")
+        shutil.copyfile(source, destination)
         os.chmod(destination, 0o644)
     except OSError as exc:
-        fail(f"cannot write output image: {exc}")
-    print(f"wrote {destination} ({len(data)} bytes)")
+        return fail("cannot write output: %s" % exc)
+    print("wrote %s (%d bytes)" % (destination, len(blob)))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run())
+
+# Notes for anyone re-running this entry
+#
+# Exit codes: 0 means the copy landed and passed every check; 1 means
+# something failed and nothing was written to the output folder. The
+# source image is validated before the output folder is touched, so a
+# bad source can never leave a half-written or stale file behind.
+#
+# Determinism: the program only copies bytes, so two runs always
+# produce the same file. Running it twice and comparing the hashes of
+# the two outputs is a quick way to confirm that.
+#
+# Limits enforced here, matching the competition rules: PNG only,
+# exactly 1024 by 1024 pixels, at most 1 MiB, every chunk CRC-checked.
