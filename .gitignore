@@ -1,0 +1,5 @@
+news-image-20261125-kit/
+*.tar.gz
+TASK.md
+PROGRESS.md
+build.py
